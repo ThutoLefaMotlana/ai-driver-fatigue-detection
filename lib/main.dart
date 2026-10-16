@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'services/backend_api.dart';
 
 late List<CameraDescription> cameras;
 
@@ -66,12 +69,102 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   FatigueLevel fatigueLevel = FatigueLevel.normal;
 
+  final BackendApi backendApi = BackendApi();
+  String? backendSessionId;
+  DateTime? lastReadingSentAt;
+  FatigueLevel lastEventLevel = FatigueLevel.normal;
+  bool backendUnavailable = false;
+
   @override
   void initState() {
     super.initState();
     startCamera();
-
+    _startBackendSession();
     alertPlayer.setReleaseMode(ReleaseMode.loop);
+  }
+
+  Future<void> _startBackendSession() async {
+    try {
+      final id = await backendApi.startSession();
+      if (!mounted) {
+        unawaited(backendApi.updateSession(id, status: 'ended'));
+        return;
+      }
+      setState(() {
+        backendSessionId = id;
+        backendUnavailable = false;
+      });
+      await _syncBackendState(forceReading: true);
+    } catch (error) {
+      if (mounted) setState(() => backendUnavailable = true);
+      debugPrint('Backend session could not start: $error');
+    }
+  }
+
+  Future<void> _syncBackendState({bool forceReading = false}) async {
+    final id = backendSessionId;
+    if (id == null) return;
+
+    try {
+      await backendApi.updateSession(
+        id,
+        status: !pilotDetected || autopilotEnabled ? 'paused' : 'active',
+        autopilotStatus: autopilotEnabled ? 'on' : 'off',
+      );
+
+      final now = DateTime.now();
+      if (forceReading ||
+          lastReadingSentAt == null ||
+          now.difference(lastReadingSentAt!) >= const Duration(seconds: 5)) {
+        await backendApi.sendReading(
+          sessionId: id,
+          blinkRatePerMinute: blinkRate,
+          ear: eyeAspectRatio,
+          fatigueLevel: fatigueLevel.name,
+        );
+        lastReadingSentAt = now;
+      }
+
+      if (fatigueLevel.index >= FatigueLevel.warning.index &&
+          fatigueLevel != lastEventLevel) {
+        final severity = switch (fatigueLevel) {
+          FatigueLevel.normal => 'Warning',
+          FatigueLevel.warning => 'Warning',
+          FatigueLevel.high => 'High',
+          FatigueLevel.critical => 'Critical',
+        };
+        await backendApi.sendFatigueEvent(
+          sessionId: id,
+          severity: severity,
+          message: switch (fatigueLevel) {
+            FatigueLevel.normal => 'Fatigue level normal',
+            FatigueLevel.warning => 'Fatigue warning detected',
+            FatigueLevel.high => 'High fatigue detected',
+            FatigueLevel.critical => 'Critical fatigue detected',
+          },
+          fatigueLevel: fatigueLevel.name,
+        );
+      }
+      lastEventLevel = fatigueLevel;
+      if (mounted && backendUnavailable) {
+        setState(() => backendUnavailable = false);
+      }
+    } catch (error) {
+      if (mounted && !backendUnavailable) {
+        setState(() => backendUnavailable = true);
+      }
+      debugPrint('Backend sync failed: $error');
+    }
+  }
+
+  Future<void> _endBackendSession() async {
+    final id = backendSessionId;
+    if (id == null) return;
+    try {
+      await backendApi.updateSession(id, status: 'ended');
+    } catch (error) {
+      debugPrint('Backend session could not be ended: $error');
+    }
   }
 
   // ======================================
@@ -175,6 +268,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
+    unawaited(_endBackendSession());
     controller?.dispose();
     alertPlayer.dispose();
 
@@ -578,6 +672,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           });
 
                           await updateAlertSound();
+                          await _syncBackendState(forceReading: true);
                         },
                       ),
 
@@ -608,6 +703,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           });
 
                           await updateAlertSound();
+                          await _syncBackendState(forceReading: true);
                         },
                       ),
 
@@ -658,6 +754,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           });
 
                           await updateAlertSound();
+                          await _syncBackendState(forceReading: true);
                         },
                       ),
                     ],
